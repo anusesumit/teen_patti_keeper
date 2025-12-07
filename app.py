@@ -178,6 +178,24 @@ def get_total_spent(player_id):
     conn.close()
     return result
 
+def get_total_won(player_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT COALESCE(SUM(pot), 0) FROM completed_rounds WHERE winner = %s", (player_id,))
+    result = cur.fetchone()[0]
+    cur.close()
+    conn.close()
+    return result
+
+def get_rounds_won(player_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM completed_rounds WHERE winner = %s", (player_id,))
+    result = cur.fetchone()[0]
+    cur.close()
+    conn.close()
+    return result
+
 def save_completed_round(round_num, pot, winner, player_totals):
     conn = get_db_connection()
     cur = conn.cursor()
@@ -234,11 +252,23 @@ def display_player_page(player_id):
     
     st.markdown(f"### Round {current_round}")
     
-    col1, col2 = st.columns(2)
+    total_spent = get_total_spent(player_id)
+    total_won = get_total_won(player_id)
+    net = total_won - total_spent
+    rounds_won = get_rounds_won(player_id)
+    
+    col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("Your Total This Round", f"₹{get_current_round_total(player_id, current_round)}")
+        st.metric("This Round", f"₹{get_current_round_total(player_id, current_round)}")
     with col2:
-        st.metric("Total Spent (All Rounds)", f"₹{get_total_spent(player_id)}")
+        st.metric("Total Spent", f"₹{total_spent}")
+    with col3:
+        st.metric("Total Won", f"₹{total_won}")
+    
+    if net >= 0:
+        st.success(f"📈 **Net Profit: +₹{net}** | Rounds Won: {rounds_won}")
+    else:
+        st.error(f"📉 **Net Loss: ₹{net}** | Rounds Won: {rounds_won}")
     
     st.markdown("---")
     
