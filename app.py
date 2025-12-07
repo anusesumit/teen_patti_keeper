@@ -2,6 +2,10 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 from datetime import datetime
+import json
+import os
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 st.set_page_config(
     page_title="Teen Patti Tracker",
@@ -9,53 +13,230 @@ st.set_page_config(
     layout="wide"
 )
 
-def initialize_session_state():
-    if 'players' not in st.session_state:
-        st.session_state.players = {
-            '1': {'name': 'Player 1', 'entries': [], 'status': 'playing', 'won_round': False},
-            '2': {'name': 'Player 2', 'entries': [], 'status': 'playing', 'won_round': False},
-            '3': {'name': 'Player 3', 'entries': [], 'status': 'playing', 'won_round': False},
-            '4': {'name': 'Player 4', 'entries': [], 'status': 'playing', 'won_round': False}
-        }
-    if 'current_round' not in st.session_state:
-        st.session_state.current_round = 1
-    if 'completed_rounds' not in st.session_state:
-        st.session_state.completed_rounds = []
+def get_db_connection():
+    return psycopg2.connect(os.environ['DATABASE_URL'])
+
+def init_db():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS game_state (
+            id INTEGER PRIMARY KEY DEFAULT 1,
+            current_round INTEGER DEFAULT 1,
+            data JSONB DEFAULT '{}'::jsonb
+        )
+    ''')
+    
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS players (
+            id VARCHAR(10) PRIMARY KEY,
+            name VARCHAR(100),
+            status VARCHAR(20) DEFAULT 'playing',
+            won_round BOOLEAN DEFAULT FALSE
+        )
+    ''')
+    
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS entries (
+            id SERIAL PRIMARY KEY,
+            player_id VARCHAR(10),
+            round_num INTEGER,
+            amount INTEGER,
+            timestamp VARCHAR(20)
+        )
+    ''')
+    
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS completed_rounds (
+            id SERIAL PRIMARY KEY,
+            round_num INTEGER,
+            pot INTEGER,
+            winner VARCHAR(10),
+            player_totals JSONB
+        )
+    ''')
+    
+    cur.execute("SELECT COUNT(*) FROM game_state")
+    if cur.fetchone()[0] == 0:
+        cur.execute("INSERT INTO game_state (id, current_round) VALUES (1, 1)")
+    
+    cur.execute("SELECT COUNT(*) FROM players")
+    if cur.fetchone()[0] == 0:
+        for i in range(1, 5):
+            cur.execute(
+                "INSERT INTO players (id, name, status, won_round) VALUES (%s, %s, 'playing', FALSE)",
+                (str(i), f'Player {i}')
+            )
+    
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def get_current_round():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT current_round FROM game_state WHERE id = 1")
+    result = cur.fetchone()
+    cur.close()
+    conn.close()
+    return result[0] if result else 1
+
+def set_current_round(round_num):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE game_state SET current_round = %s WHERE id = 1", (round_num,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def get_player(player_id):
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT * FROM players WHERE id = %s", (player_id,))
+    result = cur.fetchone()
+    cur.close()
+    conn.close()
+    return dict(result) if result else None
+
+def get_all_players():
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT * FROM players ORDER BY id")
+    results = cur.fetchall()
+    cur.close()
+    conn.close()
+    return {r['id']: dict(r) for r in results}
+
+def update_player(player_id, name=None, status=None, won_round=None):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    updates = []
+    values = []
+    if name is not None:
+        updates.append("name = %s")
+        values.append(name)
+    if status is not None:
+        updates.append("status = %s")
+        values.append(status)
+    if won_round is not None:
+        updates.append("won_round = %s")
+        values.append(won_round)
+    
+    if updates:
+        values.append(player_id)
+        cur.execute(f"UPDATE players SET {', '.join(updates)} WHERE id = %s", values)
+        conn.commit()
+    cur.close()
+    conn.close()
+
+def add_entry(player_id, amount, round_num):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    cur.execute(
+        "INSERT INTO entries (player_id, round_num, amount, timestamp) VALUES (%s, %s, %s, %s)",
+        (player_id, round_num, amount, timestamp)
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def get_entries(player_id, round_num=None):
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    if round_num:
+        cur.execute(
+            "SELECT * FROM entries WHERE player_id = %s AND round_num = %s ORDER BY id",
+            (player_id, round_num)
+        )
+    else:
+        cur.execute("SELECT * FROM entries WHERE player_id = %s ORDER BY id", (player_id,))
+    results = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [dict(r) for r in results]
+
+def get_current_round_total(player_id, round_num):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COALESCE(SUM(amount), 0) FROM entries WHERE player_id = %s AND round_num = %s",
+        (player_id, round_num)
+    )
+    result = cur.fetchone()[0]
+    cur.close()
+    conn.close()
+    return result
+
+def get_total_spent(player_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT COALESCE(SUM(amount), 0) FROM entries WHERE player_id = %s", (player_id,))
+    result = cur.fetchone()[0]
+    cur.close()
+    conn.close()
+    return result
+
+def save_completed_round(round_num, pot, winner, player_totals):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO completed_rounds (round_num, pot, winner, player_totals) VALUES (%s, %s, %s, %s)",
+        (round_num, pot, winner, json.dumps(player_totals))
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def get_completed_rounds():
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT * FROM completed_rounds ORDER BY round_num DESC")
+    results = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [dict(r) for r in results]
+
+def reset_all():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM entries")
+    cur.execute("DELETE FROM completed_rounds")
+    cur.execute("UPDATE game_state SET current_round = 1 WHERE id = 1")
+    cur.execute("UPDATE players SET status = 'playing', won_round = FALSE")
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def reset_for_new_round():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE players SET status = 'playing', won_round = FALSE")
+    conn.commit()
+    cur.close()
+    conn.close()
 
 def get_player_page():
     params = st.query_params
     return params.get('player', None)
 
-def add_entry(player_id, amount):
-    entry = {
-        'round': st.session_state.current_round,
-        'amount': amount,
-        'timestamp': datetime.now().strftime("%H:%M:%S")
-    }
-    st.session_state.players[player_id]['entries'].append(entry)
-
-def get_current_round_total(player_id):
-    entries = st.session_state.players[player_id]['entries']
-    return sum(e['amount'] for e in entries if e['round'] == st.session_state.current_round)
-
-def get_total_spent(player_id):
-    return sum(e['amount'] for e in st.session_state.players[player_id]['entries'])
-
 def display_player_page(player_id):
-    player = st.session_state.players[player_id]
+    current_round = get_current_round()
+    player = get_player(player_id)
     
     st.markdown(f"# 🎴 {player['name']}'s Table")
     
     new_name = st.text_input("Your Name", value=player['name'], key=f"name_{player_id}")
     if new_name != player['name']:
-        st.session_state.players[player_id]['name'] = new_name
+        update_player(player_id, name=new_name)
         st.rerun()
     
-    st.markdown(f"### Round {st.session_state.current_round}")
+    st.markdown(f"### Round {current_round}")
     
     col1, col2 = st.columns(2)
     with col1:
-        st.metric("Your Total This Round", f"₹{get_current_round_total(player_id)}")
+        st.metric("Your Total This Round", f"₹{get_current_round_total(player_id, current_round)}")
     with col2:
         st.metric("Total Spent (All Rounds)", f"₹{get_total_spent(player_id)}")
     
@@ -64,75 +245,55 @@ def display_player_page(player_id):
     if player['status'] == 'quit':
         st.warning("🚫 You have quit this round")
         if st.button("↩️ Rejoin Round", use_container_width=True):
-            st.session_state.players[player_id]['status'] = 'playing'
+            update_player(player_id, status='playing')
             st.rerun()
     elif player['won_round']:
         st.success("🏆 You marked yourself as winner!")
         if st.button("❌ Cancel Win", use_container_width=True):
-            st.session_state.players[player_id]['won_round'] = False
+            update_player(player_id, won_round=False)
             st.rerun()
     else:
-        st.markdown("### Add Money (multiples of 5)")
+        st.markdown("### Add Money")
         
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            if st.button("➕ ₹5", use_container_width=True):
-                add_entry(player_id, 5)
-                st.rerun()
-        with col2:
-            if st.button("➕ ₹10", use_container_width=True):
-                add_entry(player_id, 10)
-                st.rerun()
-        with col3:
-            if st.button("➕ ₹15", use_container_width=True):
-                add_entry(player_id, 15)
-                st.rerun()
+        amounts = [5, 10, 20, 40, 80, 160, 320, 640, 1280, 2560, 5120]
         
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            if st.button("➕ ₹20", use_container_width=True):
-                add_entry(player_id, 20)
-                st.rerun()
-        with col2:
-            if st.button("➕ ₹25", use_container_width=True):
-                add_entry(player_id, 25)
-                st.rerun()
-        with col3:
-            if st.button("➕ ₹50", use_container_width=True):
-                add_entry(player_id, 50)
-                st.rerun()
+        row1 = st.columns(4)
+        for i, amt in enumerate(amounts[:4]):
+            with row1[i]:
+                if st.button(f"₹{amt}", key=f"btn_{amt}_{player_id}", use_container_width=True):
+                    add_entry(player_id, amt, current_round)
+                    st.rerun()
         
-        custom_amount = st.number_input(
-            "Or enter custom amount (multiples of 5)",
-            min_value=5,
-            max_value=1000,
-            value=5,
-            step=5,
-            key=f"custom_{player_id}"
-        )
-        if st.button("➕ Add Custom Amount", use_container_width=True):
-            if custom_amount % 5 == 0:
-                add_entry(player_id, custom_amount)
-                st.rerun()
-            else:
-                st.error("Amount must be a multiple of 5!")
+        row2 = st.columns(4)
+        for i, amt in enumerate(amounts[4:8]):
+            with row2[i]:
+                if st.button(f"₹{amt}", key=f"btn_{amt}_{player_id}", use_container_width=True):
+                    add_entry(player_id, amt, current_round)
+                    st.rerun()
+        
+        row3 = st.columns(3)
+        for i, amt in enumerate(amounts[8:]):
+            with row3[i]:
+                if st.button(f"₹{amt}", key=f"btn_{amt}_{player_id}", use_container_width=True):
+                    add_entry(player_id, amt, current_round)
+                    st.rerun()
         
         st.markdown("---")
         
         col1, col2 = st.columns(2)
         with col1:
             if st.button("🚫 Quit Round", use_container_width=True, type="secondary"):
-                st.session_state.players[player_id]['status'] = 'quit'
+                update_player(player_id, status='quit')
                 st.rerun()
         with col2:
             if st.button("🏆 I Won!", use_container_width=True, type="primary"):
-                st.session_state.players[player_id]['won_round'] = True
+                update_player(player_id, won_round=True)
                 st.rerun()
     
     st.markdown("---")
     st.markdown("### Your Entries This Round")
     
-    current_entries = [e for e in player['entries'] if e['round'] == st.session_state.current_round]
+    current_entries = get_entries(player_id, current_round)
     if current_entries:
         for i, entry in enumerate(current_entries, 1):
             st.write(f"{i}. ₹{entry['amount']} at {entry['timestamp']}")
@@ -142,17 +303,29 @@ def display_player_page(player_id):
     st.markdown("---")
     st.markdown("### 📊 Quick Summary")
     
-    total_rounds_played = len(set(e['round'] for e in player['entries']))
+    all_entries = get_entries(player_id)
+    total_rounds_played = len(set(e['round_num'] for e in all_entries)) if all_entries else 0
     st.write(f"Rounds Played: {total_rounds_played}")
     st.write(f"Total Money Put In: ₹{get_total_spent(player_id)}")
     
     st.markdown("---")
     st.markdown("[🏠 Go to Dashboard](?)")
+    
+    if st.button("🔄 Refresh", use_container_width=True):
+        st.rerun()
 
 def display_dashboard():
+    current_round = get_current_round()
+    players = get_all_players()
+    
     st.markdown("# 🃏 Teen Patti Tracker - Dashboard")
     
-    st.markdown(f"### Round {st.session_state.current_round}")
+    col_title, col_refresh = st.columns([3, 1])
+    with col_title:
+        st.markdown(f"### Round {current_round}")
+    with col_refresh:
+        if st.button("🔄 Refresh Data", use_container_width=True):
+            st.rerun()
     
     st.markdown("---")
     st.markdown("### 🔗 Player Links (Share these!)")
@@ -160,13 +333,13 @@ def display_dashboard():
     cols = st.columns(4)
     for i, col in enumerate(cols):
         player_id = str(i + 1)
-        player = st.session_state.players[player_id]
+        player = players.get(player_id, {})
         with col:
-            st.markdown(f"**{player['name']}**")
+            st.markdown(f"**{player.get('name', f'Player {i+1}')}**")
             st.markdown(f"[Open Player {i+1} Page](?player={player_id})")
             
-            status_icon = "🟢" if player['status'] == 'playing' else "🔴"
-            if player['won_round']:
+            status_icon = "🟢" if player.get('status') == 'playing' else "🔴"
+            if player.get('won_round'):
                 status_icon = "🏆"
             st.write(f"Status: {status_icon}")
     
@@ -179,29 +352,29 @@ def display_dashboard():
     cols = st.columns(4)
     for i, col in enumerate(cols):
         player_id = str(i + 1)
-        player = st.session_state.players[player_id]
-        player_total = get_current_round_total(player_id)
+        player = players.get(player_id, {})
+        player_total = get_current_round_total(player_id, current_round)
         total_pot += player_total
         
-        if player['won_round']:
+        if player.get('won_round'):
             winner = player_id
         
         with col:
             status = ""
-            if player['status'] == 'quit':
+            if player.get('status') == 'quit':
                 status = " (Quit)"
-            elif player['won_round']:
+            elif player.get('won_round'):
                 status = " 🏆"
             
             st.metric(
-                f"{player['name']}{status}",
+                f"{player.get('name', f'Player {i+1}')}{status}",
                 f"₹{player_total}"
             )
     
     st.markdown(f"### 🎰 Total Pot: ₹{total_pot}")
     
     if winner:
-        winner_name = st.session_state.players[winner]['name']
+        winner_name = players.get(winner, {}).get('name', 'Unknown')
         st.success(f"🏆 {winner_name} claims the win!")
     
     st.markdown("---")
@@ -209,43 +382,35 @@ def display_dashboard():
     col1, col2 = st.columns(2)
     with col1:
         if st.button("✅ Complete Round & Calculate", use_container_width=True, type="primary"):
-            round_data = {
-                'round_num': st.session_state.current_round,
-                'pot': total_pot,
-                'winner': winner,
-                'player_totals': {
-                    pid: get_current_round_total(pid) 
-                    for pid in st.session_state.players
-                }
+            player_totals = {
+                pid: get_current_round_total(pid, current_round)
+                for pid in ['1', '2', '3', '4']
             }
-            st.session_state.completed_rounds.append(round_data)
-            
-            st.session_state.current_round += 1
-            for pid in st.session_state.players:
-                st.session_state.players[pid]['status'] = 'playing'
-                st.session_state.players[pid]['won_round'] = False
-            
+            save_completed_round(current_round, total_pot, winner, player_totals)
+            set_current_round(current_round + 1)
+            reset_for_new_round()
             st.rerun()
     
     with col2:
         if st.button("🔄 Reset Everything", use_container_width=True):
-            for key in list(st.session_state.keys()):
-                del st.session_state[key]
+            reset_all()
             st.rerun()
     
     st.markdown("---")
     st.markdown("## 📊 Aggregate Summary (All Rounds)")
     
-    if st.session_state.completed_rounds or any(get_total_spent(pid) > 0 for pid in st.session_state.players):
+    completed_rounds = get_completed_rounds()
+    
+    if completed_rounds or any(get_total_spent(pid) > 0 for pid in ['1', '2', '3', '4']):
         summary_data = []
         
-        for player_id in st.session_state.players:
-            player = st.session_state.players[player_id]
+        for player_id in ['1', '2', '3', '4']:
+            player = players.get(player_id, {})
             total_spent = get_total_spent(player_id)
             
             total_won = 0
             rounds_won = 0
-            for rd in st.session_state.completed_rounds:
+            for rd in completed_rounds:
                 if rd['winner'] == player_id:
                     total_won += rd['pot']
                     rounds_won += 1
@@ -253,7 +418,7 @@ def display_dashboard():
             net = total_won - total_spent
             
             summary_data.append({
-                'Player': player['name'],
+                'Player': player.get('name', f'Player {player_id}'),
                 'Total Spent': total_spent,
                 'Total Won': total_won,
                 'Net': net,
@@ -264,21 +429,21 @@ def display_dashboard():
         
         cols = st.columns(4)
         for i, col in enumerate(cols):
-            data = summary_data[i]
+            d = summary_data[i]
             with col:
-                net = data['Net']
-                st.markdown(f"### {data['Player']}")
-                st.write(f"💸 Spent: ₹{data['Total Spent']}")
-                st.write(f"💰 Won: ₹{data['Total Won']}")
+                net = d['Net']
+                st.markdown(f"### {d['Player']}")
+                st.write(f"💸 Spent: ₹{d['Total Spent']}")
+                st.write(f"💰 Won: ₹{d['Total Won']}")
                 
                 if net >= 0:
                     st.success(f"📈 Net: +₹{net}")
                 else:
                     st.error(f"📉 Net: ₹{net}")
                 
-                st.write(f"🏆 Rounds Won: {data['Rounds Won']}")
+                st.write(f"🏆 Rounds Won: {d['Rounds Won']}")
         
-        if len(st.session_state.completed_rounds) > 0:
+        if len(completed_rounds) > 0:
             st.markdown("---")
             
             fig = px.bar(
@@ -300,23 +465,24 @@ def display_dashboard():
     st.markdown("---")
     st.markdown("### 📜 Round History")
     
-    if st.session_state.completed_rounds:
-        for rd in reversed(st.session_state.completed_rounds):
-            winner_name = st.session_state.players[rd['winner']]['name'] if rd['winner'] else "No winner"
+    if completed_rounds:
+        for rd in completed_rounds:
+            winner_name = players.get(rd['winner'], {}).get('name', 'No winner') if rd['winner'] else "No winner"
             with st.expander(f"Round {rd['round_num']} - Pot: ₹{rd['pot']} - Winner: {winner_name}"):
-                for pid, amount in rd['player_totals'].items():
-                    player_name = st.session_state.players[pid]['name']
+                player_totals = rd['player_totals'] if isinstance(rd['player_totals'], dict) else json.loads(rd['player_totals'])
+                for pid, amount in player_totals.items():
+                    player_name = players.get(pid, {}).get('name', f'Player {pid}')
                     is_winner = pid == rd['winner']
                     st.write(f"{'🏆 ' if is_winner else ''}{player_name}: ₹{amount}")
     else:
         st.info("No completed rounds yet")
 
 def main():
-    initialize_session_state()
+    init_db()
     
     player_page = get_player_page()
     
-    if player_page and player_page in st.session_state.players:
+    if player_page and player_page in ['1', '2', '3', '4']:
         display_player_page(player_page)
     else:
         display_dashboard()
